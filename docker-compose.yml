@@ -6,13 +6,15 @@ services:
       dockerfile: Dockerfile
     container_name: news_bot
     env_file:
-      ./.env
+      - ./.env
     environment:
       - API_URL=http://api:8000/api/v1
     depends_on:
-      - api
-    # networks:
-    #   - app-network
+      api:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
 
   api:
     build:
@@ -23,56 +25,71 @@ services:
       - ./api/src/:/app/
       - .env:/app/.env
       - ./api/log:/app/log
-    # env_file:
-    # - ./.env
+    env_file:
+      - ./.env
     depends_on:
-      - db
-    # networks:
-    #   - app-network
+      db:
+        condition: service_healthy
+    networks:
+      - app-network
     ports:
       - 8000:8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
   scrapyd:
     build:
       context: ./scrapy
       dockerfile: Dockerfile
     container_name: news_scrapy
-    # чтобы пайплайны скрапа могли читать ваши общие .env-переменные
     env_file:
       - ./.env
     environment:
-      # тот же адрес, что и для bot: “http://api:8000/api/v1”
       - API_URL=http://api:8000/api/v1
     volumes:
       - ./scrapy/logs/:/app/logs
     depends_on:
-      - db
-    # network_mode: 'host'
-    # env_file:
-    # - ./.env
-    # networks:
-    #   - app-network
+      db:
+        condition: service_healthy
+    networks:
+      - app-network
     ports:
       - '6800:6800'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6800/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
   db:
     image: postgres:12
     container_name: news_db
     environment:
-      POSTGRES_PORT: 5432
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: newsdb
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PORT: ${POSTGRES_PORT}
     volumes:
       - postgres_data:/var/lib/postgresql/data/
-    # networks:
-    #   - app-network
+    networks:
+      - app-network
     ports:
-      - 5432:5432
+      - 127.0.0.1:5432:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
-# networks:
-#   app-network:
-#     driver: bridge
+networks:
+  app-network:
+    driver: bridge
 
 volumes:
   postgres_data:

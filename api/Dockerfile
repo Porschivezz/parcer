@@ -1,13 +1,10 @@
-﻿FROM python:3.11
+﻿FROM python:3.9-slim
 
 WORKDIR /app
 
-EXPOSE 8000
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ./requirements.txt /app
+COPY src/ .
 
-RUN pip install --upgrade pip && pip install -r requirements.txt --no-cache-dir
-
-COPY ./src/ /app
-
-ENTRYPOINT ["python", "main.py"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

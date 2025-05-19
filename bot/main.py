@@ -8,21 +8,44 @@ from aiogram.client.bot import DefaultBotProperties
 from aiogram.types import ContentType, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import CommandStart, Command
 from aiogram.enums.parse_mode import ParseMode
-
+from tenacity import retry, stop_after_attempt, wait_exponential
 from urllib.parse import urlparse
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+# Загружаем переменные окружения
+load_dotenv()
 
-API_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-AUTHORIZED_PASSWORD = os.environ.get('TELEGRAM_BOT_PASSWORD')
-FASTAPI_URL = os.environ.get('API_URL')
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
 
-# Проверка, что переменная окружения API_URL задана
-if not FASTAPI_URL:
-    logging.error("Переменная окружения API_URL не задана! Бот не может работать.")
-    raise RuntimeError("API_URL env variable is required!")
+logger = logging.getLogger(__name__)
 
-logging.info(f"FASTAPI_URL = {FASTAPI_URL}")
+# Получаем переменные окружения
+API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+AUTHORIZED_PASSWORD = os.getenv('TELEGRAM_BOT_PASSWORD')
+FASTAPI_URL = os.getenv('API_URL')
+
+# Проверка обязательных переменных окружения
+if not all([API_TOKEN, AUTHORIZED_PASSWORD, FASTAPI_URL]):
+    missing_vars = []
+    if not API_TOKEN:
+        missing_vars.append('TELEGRAM_BOT_TOKEN')
+    if not AUTHORIZED_PASSWORD:
+        missing_vars.append('TELEGRAM_BOT_PASSWORD')
+    if not FASTAPI_URL:
+        missing_vars.append('API_URL')
+    error_msg = f"Отсутствуют обязательные переменные окружения: {', '.join(missing_vars)}"
+    logger.error(error_msg)
+    raise RuntimeError(error_msg)
+
+logger.info(f"FASTAPI_URL = {FASTAPI_URL}")
 
 # Регулярное выражение для проверки домена
 DOMAIN_REGEX = re.compile(r'https?://(www\.)?([^/]+)')
@@ -54,23 +77,49 @@ dp = Dispatcher()
 # Временное хранилище авторизованных пользователей
 authorized_users = set()
 
+# Функция для повторных попыток API запросов
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+async def make_api_request(session, url, method='GET', **kwargs):
+    try:
+        async with getattr(session, method.lower())(url, **kwargs) as response:
+            if response.status == 200:
+                return await response.json()
+            elif response.status == 422:
+                data = await response.json()
+                raise ValueError(data.get('detail', 'Validation error'))
+            else:
+                raise aiohttp.ClientError(f"API request failed with status {response.status}")
+    except Exception as e:
+        logger.error(f"API request failed: {str(e)}")
+        raise
+
 # Определяем функцию для запуска парсинга страницы через FastAPI
 async def trigger_scrapy_spider(spider_name, url):
-    logging.info(f"Отправляю запрос к {FASTAPI_URL}/schedule/ для spider={spider_name}, url={url}")
+    logger.info(f"Отправляю запрос к {FASTAPI_URL}/schedule/ для spider={spider_name}, url={url}")
     async with aiohttp.ClientSession() as session:
-        async with session.post(f'{FASTAPI_URL}/schedule/', json={'spider': spider_name, 'url': url}) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data.get('jobid')
-            return 'Error: Failed to start scraping.'
+        try:
+            data = await make_api_request(
+                session,
+                f'{FASTAPI_URL}/schedule/',
+                method='POST',
+                json={'spider': spider_name, 'url': url}
+            )
+            return data.get('jobid')
+        except Exception as e:
+            logger.error(f"Failed to trigger spider: {str(e)}")
+            return None
 
 # Определяем паука в зависимости от домена
 def get_spider_name_by_domain(url):
-    domain = urlparse(url).netloc
-    for allowed in ALLOWED_DOMAINS:
-        if allowed in domain:
-            return DOMAIN_SPIDER_MAP.get(allowed)
-    return None
+    try:
+        domain = urlparse(url).netloc
+        for allowed in ALLOWED_DOMAINS:
+            if allowed in domain:
+                return DOMAIN_SPIDER_MAP.get(allowed)
+        return None
+    except Exception as e:
+        logger.error(f"Error parsing domain: {str(e)}")
+        return None
 
 # Клавиатура с опциями для получения текста статьи или ссылки на Telegraph
 def item_events_markup(job_id: str):
@@ -144,7 +193,7 @@ async def handle_message(message: types.Message):
         )
         return
 
-    url = message.text
+    url = message.text.strip()
     domain_match = DOMAIN_REGEX.search(url)
     if not domain_match:
         await message.answer(
@@ -161,60 +210,74 @@ async def handle_message(message: types.Message):
         )
         return
 
-    # Отправляем запрос в сторонний сервис для парсинга
-    logging.info(f"Отправляю запрос к {FASTAPI_URL}/scrapyd/schedule/ для url={url}")
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f'{FASTAPI_URL}/scrapyd/schedule/',
-            params={'chat_id': message.chat.id, 'url': url}
-        ) as response:
-            if response.status == 422:
-                data = await response.json()
-                return await message.answer(
-                    data.get('detail')
-                )
-            if response.status != 200:
-                return await message.answer(
-                    '‼️ Ошибка при запуске парсера. Попробуйте позже.'
-                )
-            data = await response.json()
-            return await message.answer(
+    # Отправляем запрос в API для парсинга
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await make_api_request(
+                session,
+                f'{FASTAPI_URL}/scrapyd/schedule/',
+                method='POST',
+                params={'chat_id': message.chat.id, 'url': url}
+            )
+            await message.answer(
                 '⏱️ Подождите, запрос обрабатывается...',
                 parse_mode=ParseMode.HTML
             )
+    except ValueError as e:
+        await message.answer(str(e))
+    except Exception as e:
+        logger.error(f"Error processing URL: {str(e)}")
+        await message.answer(
+            '‼️ Произошла ошибка при обработке запроса. Попробуйте позже.'
+        )
 
 # Обработка нажатий на кнопки
 @dp.callback_query()
 async def callback_query_handler(call: types.CallbackQuery):
-    action, id_ = call.data.split(':')
-    if action == 'get_translate':
-        logging.info(f"Отправляю запрос к {FASTAPI_URL}/items/{id_}/translate")
+    try:
+        action, id_ = call.data.split(':')
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                    f'{FASTAPI_URL}/items/{id_}/translate') as response:
-                if response.status == 200:
-                    message = '⏱️ Подождите, запрос обрабатывается...'
-                else:
-                    message = '⚠️ Что-то пошло не так'
-        await call.message.answer(message, parse_mode=ParseMode.HTML)
-    elif action == 'get_summary':
-        logging.info(f"Отправляю запрос к {FASTAPI_URL}/items/{id_}/summarize")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                    f'{FASTAPI_URL}/items/{id_}/summarize') as response:
-                if response.status == 200:
-                    message = '⏱️ Подождите, запрос обрабатывается...'
-                else:
-                    message = '⚠️ Что-то пошло не так'
+            if action == 'get_translate':
+                logger.info(f"Отправляю запрос к {FASTAPI_URL}/items/{id_}/translate")
+                await make_api_request(
+                    session,
+                    f'{FASTAPI_URL}/items/{id_}/translate',
+                    method='GET'
+                )
+                message = '⏱️ Подождите, запрос обрабатывается...'
+            elif action == 'get_summary':
+                logger.info(f"Отправляю запрос к {FASTAPI_URL}/items/{id_}/summarize")
+                await make_api_request(
+                    session,
+                    f'{FASTAPI_URL}/items/{id_}/summarize',
+                    method='GET'
+                )
+                message = '⏱️ Подождите, запрос обрабатывается...'
+            else:
+                message = '⚠️ Неизвестное действие'
+            
+            await call.message.answer(message, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Error in callback handler: {str(e)}")
         await call.message.answer(
-            message, parse_mode=ParseMode.HTML
+            '⚠️ Произошла ошибка при обработке запроса. Попробуйте позже.'
         )
 
 async def main():
-    # Сбрасываем webhook, чтобы Telegram не пытался доставлять обновления через HTTP
-    await bot.delete_webhook(drop_pending_updates=True)
-    # Запускаем polling (единожды!)
-    await dp.start_polling(bot)
+    try:
+        # Сбрасываем webhook, чтобы Telegram не пытался доставлять обновления через HTTP
+        await bot.delete_webhook(drop_pending_updates=True)
+        # Запускаем polling
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Error in main: {str(e)}")
+        raise
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot stopped due to error: {str(e)}")
+        raise
