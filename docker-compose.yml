@@ -1,0 +1,78 @@
+version: '3.11'
+services:
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: news_bot
+    env_file:
+      ./.env
+    environment:
+      - API_URL=http://api:8000/api/v1
+    depends_on:
+      - api
+    # networks:
+    #   - app-network
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: news_api
+    volumes:
+      - ./api/src/:/app/
+      - .env:/app/.env
+      - ./api/log:/app/log
+    # env_file:
+    # - ./.env
+    depends_on:
+      - db
+    # networks:
+    #   - app-network
+    ports:
+      - 8000:8000
+
+  scrapyd:
+    build:
+      context: ./scrapy
+      dockerfile: Dockerfile
+    container_name: news_scrapy
+    # чтобы пайплайны скрапа могли читать ваши общие .env-переменные
+    env_file:
+      - ./.env
+    environment:
+      # тот же адрес, что и для bot: “http://api:8000/api/v1”
+      - API_URL=http://api:8000/api/v1
+    volumes:
+      - ./scrapy/logs/:/app/logs
+    depends_on:
+      - db
+    # network_mode: 'host'
+    # env_file:
+    # - ./.env
+    # networks:
+    #   - app-network
+    ports:
+      - '6800:6800'
+
+  db:
+    image: postgres:12
+    container_name: news_db
+    environment:
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: newsdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    # networks:
+    #   - app-network
+    ports:
+      - 5432:5432
+
+# networks:
+#   app-network:
+#     driver: bridge
+
+volumes:
+  postgres_data:
